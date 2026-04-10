@@ -1,5 +1,5 @@
 """
-竞品内容分析工具 · Pro v4
+竞品内容分析工具
 新增：动态粉丝分层 · 品类嵌套词库 · 高分辨率特征 · Excel 图表导出
 """
 
@@ -403,7 +403,10 @@ def build_excel(flt, strategy_facts, top10, kw_df, brand_df, ai_insight: str) ->
     output = io.BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        flt.to_excel(writer,            sheet_name="原始数据",       index=False)
+        # 导出时去掉机器生成的中间列，保持表格整洁
+        export_drop = [c for c in ["机器识别_营销动机"] if c in flt.columns]
+        flt_export = flt.drop(columns=export_drop)
+        flt_export.to_excel(writer,     sheet_name="原始数据",       index=False)
         top10.to_excel(writer,          sheet_name="TOP10爆款内容",  index=False)
         kw_df.to_excel(writer,          sheet_name="关键词分析",     index=False)
         brand_df.to_excel(writer,       sheet_name="竞品对比",       index=False)
@@ -416,12 +419,11 @@ def build_excel(flt, strategy_facts, top10, kw_df, brand_df, ai_insight: str) ->
 
         # 2. 自动插入 Methodology 指标逻辑说明页
         pd.DataFrame({
-            "指标名称": ["互动率", "动态粉丝分层", "黑马指数", "营销动机"],
+            "指标名称": ["互动率", "动态粉丝分层", "黑马指数"],
             "业务逻辑说明": [
                 "互动总量 / 博主粉丝量。衡量内容在粉丝群体中的穿透效率。",
                 "根据本次上传数据的实际分布，使用四分位数(qcut)动态划分为草根、腰部、头腰、头部。",
                 "黑马内容判定标准：综合考虑『互动率偏离度』与『点赞规模偏离度』，大于1.2视为黑马。",
-                "基于双轨语料库（通用钩子+行业专属词汇）进行关键词捕捉与归类。"
             ]
         }).to_excel(writer, sheet_name="Methodology", index=False)
 
@@ -510,27 +512,48 @@ def format_prompt(facts_df: pd.DataFrame) -> str:
     )
 
 
-def call_ai(api_key: str, model_type: str, prompt: str) -> str:
+# 国内可用大模型配置表（均兼容 OpenAI SDK 格式）
+MODEL_CONFIGS = {
+    "Kimi":    {"base_url": "https://api.moonshot.cn/v1",
+                "model":    "moonshot-v1-8k"},
+    "DeepSeek":{"base_url": "https://api.deepseek.com",
+                "model":    "deepseek-chat"},
+    "通义千问": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "model":    "qwen-turbo"},
+    "豆包":    {"base_url": "https://ark.cn-beijing.volces.com/api/v3",
+                "model":    "doubao-pro-32k"},
+}
+
+def call_ai(api_key: str, model_type: str, prompt: str, temperature: float = 0.7) -> str:
     if not _HAS_OPENAI:
         return "请先安装 openai 库：pip3 install openai"
-    client = (_OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-              if model_type == "DeepSeek" else _OpenAI(api_key=api_key))
-    model  = "deepseek-chat" if model_type == "DeepSeek" else "gpt-4o-mini"
+    cfg    = MODEL_CONFIGS.get(model_type, MODEL_CONFIGS["Kimi"])
+    client = _OpenAI(api_key=api_key, base_url=cfg["base_url"])
     resp   = client.chat.completions.create(
-        model=model,
+        model=cfg["model"],
         messages=[{"role": "user", "content": prompt}],
         max_tokens=1200,
+        temperature=temperature,
         timeout=60
     )
     return resp.choices[0].message.content
-
-
-# ══════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════
 # 品类词库本地化管理 (恢复辅助函数)
 # ══════════════════════════════════════════════════════════════
 CATEGORY_LEXICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "category_lexicon.json")
+
+# ── 本地配置：自动读取 Kimi 默认 Key ────────────────────────────
+# Key 存在用户主目录，不随项目文件夹分享出去
+_CONFIG_PATH = os.path.expanduser("~/.competitor-analysis/config.json")
+def _load_config() -> dict:
+    try:
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+_CONFIG = _load_config()
+KIMI_DEFAULT_KEY = _CONFIG.get("kimi_api_key", "")
 
 def load_category_lexicon() -> dict:
     if os.path.exists(CATEGORY_LEXICON_PATH):
@@ -616,11 +639,29 @@ elif uploaded_file is not None:
 with st.sidebar:
     st.markdown("---")
     st.header("🤖 AI 配置")
-    model_choice = st.selectbox("模型", ["DeepSeek（推荐·便宜）", "OpenAI GPT-4o-mini"])
-    model_type   = "DeepSeek" if "DeepSeek" in model_choice else "OpenAI"
-    api_key      = st.text_input("API Key", type="password", placeholder="sk-...")
+    model_choice = st.selectbox("模型", [
+        "Kimi（月之暗面·推荐）",
+        "DeepSeek（深度求索·便宜）",
+        "通义千问（阿里云）",
+        "豆包（字节跳动）",
+    ])
+    model_type   = model_choice.split("（")[0]
+    _default_key = KIMI_DEFAULT_KEY if model_type == "Kimi" else ""
+    _label       = "API Key（已预设）" if model_type == "Kimi" else "API Key"
+    _placeholder = "Kimi Key 已自动载入" if model_type == "Kimi" else "请输入对应模型的 API Key"
+    api_key = st.text_input(
+        _label, value=_default_key, type="password",
+        placeholder=_placeholder, key=f"apikey_{model_type}",
+    )
     if not _HAS_OPENAI:
-        st.warning("未检测到 openai 库：\npip3 install openai")
+        st.warning("未检测到 openai 库，请在终端运行：\npip3 install openai")
+    ai_temperature = st.slider(
+        "🌡️ 创意温度",
+        min_value=0.0, max_value=1.5, value=0.7, step=0.1,
+        help="低温（0.2-0.5）= 贴近数据、稳健严谨；高温（0.9-1.5）= 发散创意、风格多变",
+        key="ai_temperature",
+    )
+    st.caption("低温 → 模仿爆款规律　　高温 → 创意头脑风暴")
 
     st.markdown("---")
     st.header("🎛️ 黑马指数调节")
@@ -633,59 +674,29 @@ with st.sidebar:
     enable_dewater = st.toggle("开启全域去水模式", value=False,
                                help="开启后，所有流量规模指标将乘以对应系数，折算为统一基准（消除通胀）")
     default_rates = pd.DataFrame([
-        {"平台": "小红书",   "水份系数": 1.0},
-        {"平台": "抖音",     "水份系数": 0.1},
-        {"平台": "微信视频号","水份系数": 2.0},
-        {"平台": "B站",      "水份系数": 1.5},
-        {"平台": "微博",     "水份系数": 0.05},
+        {"平台": "小红书",    "水份系数": 1.0},
+        {"平台": "抖音",      "水份系数": 0.1},
+        {"平台": "微信视频号", "水份系数": 2.0},
+        {"平台": "B站",       "水份系数": 1.5},
+        {"平台": "微博",      "水份系数": 0.05},
     ])
     edited_rates = st.data_editor(
         default_rates, num_rows="dynamic", hide_index=True,
-        use_container_width=True, disabled=not enable_dewater
+        use_container_width=True, disabled=not enable_dewater,
     )
     rates_dict = dict(zip(edited_rates["平台"], edited_rates["水份系数"]))
     rates_json = json.dumps(rates_dict, ensure_ascii=False)
 
-    st.markdown("---")
-    st.header("🗂️ 品类词库配置")
-    st.caption("三列结构：品类 | 动机 | 关键词 — 可直接增删改")
-    lex_df = nested_lexicon_to_df(st.session_state.category_lexicon)
-    edited = st.data_editor(
-        lex_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "品类":  st.column_config.TextColumn("品类",  required=True, help="如：护肤、彩妆、通用"),
-            "动机":  st.column_config.TextColumn("动机",  required=True, help="如：痛点焦虑、权威背书"),
-            "关键词": st.column_config.TextColumn("关键词", required=True),
-        },
-        hide_index=True, key="lex_editor",
-    )
-    ca, cb = st.columns(2)
-    with ca:
-        if st.button("✅ 临时应用", use_container_width=True):
-            st.session_state.category_lexicon = df_to_nested_lexicon(edited)
-            load_data.clear()
-            st.toast("词库已临时应用！", icon="✅")
-    with cb:
-        if st.button("💾 永久保存", use_container_width=True):
-            new_lex = df_to_nested_lexicon(edited)
-            st.session_state.category_lexicon = new_lex
-            save_category_lexicon(new_lex)
-            load_data.clear()
-            st.toast("已永久保存至 category_lexicon.json！", icon="💾")
-    src = "📄 category_lexicon.json" if os.path.exists(CATEGORY_LEXICON_PATH) else "🔧 内置默认"
-    st.caption(f"词库来源：{src}")
 
 
 # ══════════════════════════════════════════════════════════════
 # 主界面
 # ══════════════════════════════════════════════════════════════
-st.title("📊 竞品内容分析工具 · Pro v4")
+st.title("📊 竞品内容分析工具")
 st.caption("动态粉丝分层 · 品类感知词库 · 高分辨率特征 · AI 洞察 · Excel 图表导出")
 
 if not file_bytes:
-    st.info('👈 请在左侧上传 Excel 数据文件，或勾选「使用美妆护肤示例数据」开始分析')
+    st.info("👈 请在左侧上传 Excel 数据文件，或勾选「使用美妆护肤示例数据」开始分析")
 
     with st.expander("📖 品类嵌套词库架构说明", expanded=True):
         st.markdown("""
@@ -727,7 +738,7 @@ else:
         file_bytes, file_name,
         gen_json, ind_json,
         dh_weight_eff, dh_weight_scale,
-        enable_dewater, rates_json
+        enable_dewater, rates_json,
     )
 
     if errors:
@@ -845,60 +856,27 @@ else:
 
         c1, c2 = st.columns(2)
         
-        # 👇 新增：定义全局统一的视觉调色盘 (Color Map)
-        MOTIVE_COLORS = {
-            "痛点焦虑": "#ff6b6b", # 警示红
-            "权威背书": "#4ecdc4", # 专业青
-            "利益获得": "#a8e6cf", # 获得绿
-            "社交货币": "#ffd93d", # 社交黄
-            "复合策略": "#c3aed6", # 复合紫
-            "无明显动机": "#e0e0e0", # 灰色
-            "其他": "#f0f0f0"
-        }
-
-        # 构建关键词与动机的映射字典 (反向查找)
-        lexicon_dict = st.session_state.category_lexicon
-        kw_to_motive = {}
-        for cat, motives in lexicon_dict.items():
-            for motive, kws_list in motives.items():
-                for kw in kws_list: 
-                    kw_to_motive[kw] = motive
-
         with c1:
-            st.subheader("🔑 爆款关键词 TOP 20 (色彩同频)")
-            st.caption("条形图颜色已与右侧营销动机自动绑定")
+            st.subheader("🔑 爆款关键词 TOP 20")
             sample = flt.nlargest(min(50, len(flt)), "互动总量")["内容标题"].tolist()
             kws = extract_keywords(sample)
             if kws:
-                # 提取关键词时，顺便标记它的所属动机
-                kw_data = [{"关键词": kw, "出现次数": cnt, "营销动机": kw_to_motive.get(kw, "其他")} 
-                           for kw, cnt in kws]
-                kw_viz = pd.DataFrame(kw_data)
-                
+                kw_viz = pd.DataFrame(kws, columns=["关键词", "出现次数"])
                 fig_bar = px.bar(kw_viz, x="出现次数", y="关键词", orientation="h",
-                                 color="营销动机", color_discrete_map=MOTIVE_COLORS, # 强制绑定颜色
-                                 title="爆款内容高频词")
-                fig_bar.update_layout(yaxis=dict(autorange="reversed"), height=500)
+                                 title="爆款内容高频词",
+                                 color="出现次数", color_continuous_scale="Blues")
+                fig_bar.update_layout(yaxis=dict(autorange="reversed"), height=500,
+                                      coloraxis_showscale=False)
                 st.plotly_chart(fig_bar, use_container_width=True)
 
         with c2:
-            st.subheader("🎯 营销动机分布（品类感知）")
+            st.subheader("🎯 营销动机分布")
             mot = flt["营销动机"].value_counts().reset_index()
             mot.columns = ["营销动机", "数量"]
-            
             fig_pie = px.pie(mot, names="营销动机", values="数量",
-                             title="内容营销动机占比", hole=0.4,
-                             color="营销动机", color_discrete_map=MOTIVE_COLORS) # 强制绑定同一套颜色
+                             title="内容营销动机占比", hole=0.4)
             st.plotly_chart(fig_pie, use_container_width=True)
 
-            # ... (保留你原有的 📏 动态标题长度 vs 平均互动量 的代码) ...
-
-        # 你的外层应该是 c2 列
-        with c2:
-            st.subheader("🎯 营销动机分布（品类感知）")
-            # ... (上面画饼图的代码) ...
-
-            # 👇 从这里开始，下面所有这一层级的代码，左边必须【完全对齐】
             st.subheader("📏 动态标题长度 vs 平均互动量")
             bin_step = st.slider("调整字数区间跨度", min_value=1, max_value=5, value=5, step=1, key="title_bin_step", help="左右拖动，寻找不同颗粒度下的爆款标题长度甜区")
             
@@ -957,36 +935,36 @@ else:
                 with st.spinner("🧠 AI 正在深度拆解爆款逻辑，撰写网感文案中..."):
                     # 组装给大模型的 Prompt（提示词工程）
                     system_prompt = f"""
-                    你是一个百万粉级别的爆款操盘手和文案专家。请深度拆解以下竞品爆款的基因，并结合我的产品卖点，仿写 3 篇可以直接发布的小红书/抖音爆款文案。
+你是一个百万粉级别的爆款操盘手和文案专家。请深度拆解以下竞品爆款的基因，并结合我的产品卖点，仿写 3 篇可以直接发布的小红书/抖音爆款文案。
+
+【对标爆款基因】
+- 爆款原标题：{target_title}
+- 营销动机类型：{motive}
+
+【我的产品卖点】
+{my_product}
+
+【硬性要求 — 标题多样化】
+3 篇文案的标题必须使用完全不同的句式结构，严禁只替换品牌名：
+- 第 1 篇：疑问/反常识句（如"为什么XXX？"、"你真的了解XXX吗？"）
+- 第 2 篇：数字/对比/清单句（如"用了3个月的真实感受"、"平价vs大牌"）
+- 第 3 篇：场景/情感共鸣句（如"上班族必备"、"熬夜党救星"）
+
+【内容要求】
+每篇包含：吸睛标题 + 痛点引入 + 产品自然植入（不生硬） + 促单转化结尾。
+排版有呼吸感，加入适当 Emoji，语言有网感，像真实博主在写，而非广告腔。
+"""
                     
-                    【对标爆款基因】
-                    - 爆款原标题：{target_title}
-                    - 核心营销动机：{motive}
-                    
-                    【我的产品卖点】
-                    {my_product}
-                    
-                    【严格输出要求】
-                    1. 深度模仿原标题的句式结构（如：反常识、数字对比、痛点放大）。
-                    2. 完美契合"{motive}"的受众心理套路。
-                    3. 每篇包含：吸睛标题 + 痛点引入 + 产品自然植入（不生硬） + 促单转化结尾。
-                    4. 排版要有呼吸感，加入适当的 Emoji 符号，语言必须有"网感"。
-                    """
-                    
-                    # ---------------------------------------------------------
-                    # 🔔 这里接入你们的 DeepSeek / OpenAI API 调用逻辑
-                    # 例如：
-                    # response = client.chat.completions.create(
-                    #     model="deepseek-chat",
-                    #     messages=[{"role": "user", "content": system_prompt}]
-                    # )
-                    # result_text = response.choices[0].message.content
-                    # ---------------------------------------------------------
-                    
-                    # 暂时用一个展示框把 Prompt 打印出来，等你把 API 代码接通后，直接 st.write(result_text) 即可
-                    st.success("🎉 Prompt 构建成功！(对接 API 后即可直接显示生成的文案)")
-                    with st.expander("👀 查看 AI Prompt 后台指令 (调试用)", expanded=True):
-                        st.code(system_prompt, language="markdown")
+                    if not api_key:
+                        st.warning("请先在左侧侧边栏填入 API Key")
+                    else:
+                        try:
+                            result_text = call_ai(api_key, model_type, system_prompt,
+                                                  temperature=ai_temperature)
+                            st.success("🎉 AI 文案生成完成！")
+                            st.markdown(result_text)
+                        except Exception as e:
+                            st.error(f"AI 调用失败：{e}")
 
             # ━━━ Tab2 黑马分析 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     with tab2:
@@ -1000,8 +978,12 @@ else:
 
         c1, c2 = st.columns(2)
         with c1:
-            fig_box = px.box(flt, x="粉丝层级", y="黑马指数",
-                             color="粉丝层级", points="all",
+            # 去极端值：裁掉 5th–95th 百分位以外的数据，图表更舒展
+            bhi_q05 = flt["黑马指数"].quantile(0.05)
+            bhi_q95 = flt["黑马指数"].quantile(0.95)
+            flt_box = flt[flt["黑马指数"].between(bhi_q05, bhi_q95)]
+            fig_box = px.box(flt_box, x="粉丝层级", y="黑马指数",
+                             color="粉丝层级", points="outliers",
                              title="各粉丝层级黑马指数分布（动态分层）")
             fig_box.add_hline(y=1.2, line_dash="dash", line_color="red",
                               annotation_text="黑马阈值 1.2")
@@ -1173,7 +1155,8 @@ else:
                 with st.spinner("🤖 AI 分析中（10-30 秒）…"):
                     try:
                         st.session_state.ai_insight = call_ai(
-                            api_key, model_type, format_prompt(strategy_facts)
+                            api_key, model_type, format_prompt(strategy_facts),
+                            temperature=ai_temperature,
                         )
                     except Exception as e:
                         msg = str(e)
