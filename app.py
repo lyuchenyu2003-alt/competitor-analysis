@@ -584,51 +584,37 @@ if "fan_bins" not in st.session_state:
 # ══════════════════════════════════════════════════════════════
 # 侧边栏
 # ══════════════════════════════════════════════════════════════
+# --- 数据上传与示例加载区 ---
+st.sidebar.header("📂 数据源配置")
+
+# 1. 增加一个勾选框：使用示例数据
+use_sample = st.sidebar.checkbox("使用美妆护肤示例数据", value=False, help="开启后将自动加载 500 条行业仿真数据，无需手动上传")
+
+uploaded_file = st.sidebar.file_uploader("或者上传你自己的 Excel 文件", type=["xlsx"])
+
+# 2. 核心逻辑切换
+df = None
+file_bytes = None
+file_name = ""
+
+if use_sample:
+    # 自动读取本地的示例文件
+    sample_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Skincare_Marketing_Final_Demo.xlsx")
+    try:
+        with open(sample_path, "rb") as f:
+            file_bytes = f.read()
+        file_name = sample_path
+        st.sidebar.success("✅ 已加载行业示例数据")
+    except FileNotFoundError:
+        st.sidebar.error("❌ 未找到示例文件，请确保文件在代码目录下")
+elif uploaded_file is not None:
+    file_bytes = uploaded_file.getvalue()
+    file_name = uploaded_file.name
+    st.sidebar.success(f"✅ 已上传: {file_name}")
+
+# ── 侧边栏：AI 配置 + BHI 权重 + 去水 + 词库（始终渲染）──────
 with st.sidebar:
-    st.header("📁 数据上传")
-    uploaded_file = st.file_uploader(
-        "上传 Excel 文件（.xlsx）", type=["xlsx"],
-        help="旧版 .xls 请先另存为 .xlsx"
-    )
-
     st.markdown("---")
-
-    # 👇 新增：黑马指数动态权重调节 👇
-    st.header("🎛️ 黑马指数调节")
-    dh_weight_eff = st.slider("效率权重（互动率）", 0.0, 1.0, 0.7, 0.1)
-    dh_weight_scale = 1.0 - dh_weight_eff  
-    st.caption(f"当前规模权重（点赞数）为: {dh_weight_scale:.1f}")
-    st.markdown("---")
-    # 👆 新增结束 👆
-
-    # 👇 新增：跨平台水位线折算 (控制面板) 👇
-    st.header("🌊 跨平台水位折算")
-    enable_dewater = st.toggle("开启全域去水模式", value=False, help="开启后，所有流量规模指标将乘以对应系数，折算为统一基准（消除通胀）")
-    
-    # 默认的行业经验汇率（以小红书为 1.0 基准）
-    default_rates = pd.DataFrame([
-        {"平台": "小红书", "水份系数": 1.0},
-        {"平台": "抖音", "水份系数": 0.1},
-        {"平台": "微信视频号", "水份系数": 2.0},
-        {"平台": "B站", "水份系数": 1.5},
-        {"平台": "微博", "水份系数": 0.05},
-    ])
-    
-    edited_rates = st.data_editor(
-        default_rates, 
-        num_rows="dynamic", 
-        hide_index=True,
-        use_container_width=True,
-        disabled=not enable_dewater # 当开关关闭时，表格变灰不可编辑
-    )
-    # 将表格转换为字典与 JSON 字符串
-    rates_dict = dict(zip(edited_rates["平台"], edited_rates["水份系数"]))
-    rates_json = json.dumps(rates_dict, ensure_ascii=False)
-    
-    st.markdown("---")
-    # 👆 新增结束 👆
-
-
     st.header("🤖 AI 配置")
     model_choice = st.selectbox("模型", ["DeepSeek（推荐·便宜）", "OpenAI GPT-4o-mini"])
     model_type   = "DeepSeek" if "DeepSeek" in model_choice else "OpenAI"
@@ -637,37 +623,44 @@ with st.sidebar:
         st.warning("未检测到 openai 库：\npip3 install openai")
 
     st.markdown("---")
-
-    # 👇 新增：黑马指数动态权重调节
     st.header("🎛️ 黑马指数调节")
-    # 注意：因为已经在 with st.sidebar: 里面了，直接用 st.slider 就会渲染在侧边栏
-    dh_weight_eff = st.slider("效率权重（互动率）", 0.0, 1.0, 0.7, 0.1, key="weight_slider")
-    dh_weight_scale = 1.0 - dh_weight_eff  
+    dh_weight_eff   = st.slider("效率权重（互动率）", 0.0, 1.0, 0.7, 0.1, key="weight_slider")
+    dh_weight_scale = 1.0 - dh_weight_eff
     st.caption(f"当前规模权重（点赞数）为: {dh_weight_scale:.1f}")
 
     st.markdown("---")
-    # 👆 新增结束
+    st.header("🌊 跨平台水位折算")
+    enable_dewater = st.toggle("开启全域去水模式", value=False,
+                               help="开启后，所有流量规模指标将乘以对应系数，折算为统一基准（消除通胀）")
+    default_rates = pd.DataFrame([
+        {"平台": "小红书",   "水份系数": 1.0},
+        {"平台": "抖音",     "水份系数": 0.1},
+        {"平台": "微信视频号","水份系数": 2.0},
+        {"平台": "B站",      "水份系数": 1.5},
+        {"平台": "微博",     "水份系数": 0.05},
+    ])
+    edited_rates = st.data_editor(
+        default_rates, num_rows="dynamic", hide_index=True,
+        use_container_width=True, disabled=not enable_dewater
+    )
+    rates_dict = dict(zip(edited_rates["平台"], edited_rates["水份系数"]))
+    rates_json = json.dumps(rates_dict, ensure_ascii=False)
 
-    # 品类嵌套词库编辑器（三列：品类 | 动机 | 关键词）
+    st.markdown("---")
     st.header("🗂️ 品类词库配置")
     st.caption("三列结构：品类 | 动机 | 关键词 — 可直接增删改")
-
     lex_df = nested_lexicon_to_df(st.session_state.category_lexicon)
     edited = st.data_editor(
         lex_df,
         num_rows="dynamic",
         use_container_width=True,
         column_config={
-            "品类":  st.column_config.TextColumn("品类",  required=True,
-                                                  help="如：护肤、彩妆、通用"),
-            "动机":  st.column_config.TextColumn("动机",  required=True,
-                                                  help="如：痛点焦虑、权威背书"),
+            "品类":  st.column_config.TextColumn("品类",  required=True, help="如：护肤、彩妆、通用"),
+            "动机":  st.column_config.TextColumn("动机",  required=True, help="如：痛点焦虑、权威背书"),
             "关键词": st.column_config.TextColumn("关键词", required=True),
         },
-        hide_index=True,
-        key="lex_editor",
+        hide_index=True, key="lex_editor",
     )
-
     ca, cb = st.columns(2)
     with ca:
         if st.button("✅ 临时应用", use_container_width=True):
@@ -681,7 +674,6 @@ with st.sidebar:
             save_category_lexicon(new_lex)
             load_data.clear()
             st.toast("已永久保存至 category_lexicon.json！", icon="💾")
-
     src = "📄 category_lexicon.json" if os.path.exists(CATEGORY_LEXICON_PATH) else "🔧 内置默认"
     st.caption(f"词库来源：{src}")
 
@@ -692,8 +684,8 @@ with st.sidebar:
 st.title("📊 竞品内容分析工具 · Pro v4")
 st.caption("动态粉丝分层 · 品类感知词库 · 高分辨率特征 · AI 洞察 · Excel 图表导出")
 
-if uploaded_file is None:
-    st.info("👈 请在左侧上传 Excel 数据文件开始分析")
+if not file_bytes:
+    st.info('👈 请在左侧上传 Excel 数据文件，或勾选「使用美妆护肤示例数据」开始分析')
 
     with st.expander("📖 品类嵌套词库架构说明", expanded=True):
         st.markdown("""
@@ -724,26 +716,18 @@ if uploaded_file is None:
         """)
 
 else:
-    file_bytes = uploaded_file.read()
-    
-    # 1. 拆分双轨词库：从现有的词库中，把“通用”和“行业”拆开
+    # file_bytes / file_name 已在侧边栏数据源区设置好（支持示例数据和上传文件）
     lexicon_dict = st.session_state.category_lexicon
-    general_lex = lexicon_dict.get("通用", {})
+    general_lex  = lexicon_dict.get("通用", {})
     industry_lex = {k: v for k, v in lexicon_dict.items() if k != "通用"}
-    
-    gen_json = json.dumps(general_lex, ensure_ascii=False)
+    gen_json = json.dumps(general_lex,  ensure_ascii=False)
     ind_json = json.dumps(industry_lex, ensure_ascii=False)
 
-    # 2. 调用我们刚刚升级的 load_data 引擎，把侧边栏的权重传进去
     df, errors, fan_bins = load_data(
-        file_bytes, 
-        uploaded_file.name, 
-        gen_json, 
-        ind_json, 
-        dh_weight_eff, 
-        dh_weight_scale,
-        enable_dewater, # 👇 新增参数
-        rates_json      # 👇 新增参数
+        file_bytes, file_name,
+        gen_json, ind_json,
+        dh_weight_eff, dh_weight_scale,
+        enable_dewater, rates_json
     )
 
     if errors:
@@ -984,9 +968,9 @@ else:
                     
                     【严格输出要求】
                     1. 深度模仿原标题的句式结构（如：反常识、数字对比、痛点放大）。
-                    2. 完美契合“{motive}”的受众心理套路。
+                    2. 完美契合"{motive}"的受众心理套路。
                     3. 每篇包含：吸睛标题 + 痛点引入 + 产品自然植入（不生硬） + 促单转化结尾。
-                    4. 排版要有呼吸感，加入适当的 Emoji 符号，语言必须有“网感”。
+                    4. 排版要有呼吸感，加入适当的 Emoji 符号，语言必须有"网感"。
                     """
                     
                     # ---------------------------------------------------------
