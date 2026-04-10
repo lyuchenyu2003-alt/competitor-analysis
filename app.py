@@ -399,7 +399,8 @@ def build_strategy_facts(df: pd.DataFrame) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════
 # Excel 导出（含图表 / 首行冻结 / 自动筛选 / 色阶 / Methodology）
 # ══════════════════════════════════════════════════════════════
-def build_excel(flt, strategy_facts, top10, kw_df, brand_df, ai_insight: str) -> io.BytesIO:
+def build_excel(flt, strategy_facts, top10, kw_df, brand_df, ai_insight: str,
+                interact_df=None, brand_top5_df=None, platform_df=None) -> io.BytesIO:
     output = io.BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -411,11 +412,26 @@ def build_excel(flt, strategy_facts, top10, kw_df, brand_df, ai_insight: str) ->
         kw_df.to_excel(writer,          sheet_name="关键词分析",     index=False)
         brand_df.to_excel(writer,       sheet_name="竞品对比",       index=False)
         strategy_facts.to_excel(writer, sheet_name="Strategy_Facts", index=False)
-        
-        # 1. 自动插入 AI 洞察页
-        pd.DataFrame([{"AI洞察报告": ai_insight or "(尚未生成)"}]).to_excel(
-            writer, sheet_name="AI_Insight", index=False
-        )
+
+        # 新增：互动类型拆解 / 品牌 TOP5 / 平台对比 sheets
+        if interact_df is not None and len(interact_df) > 0:
+            interact_df.to_excel(writer, sheet_name="互动类型拆解", index=False)
+        if brand_top5_df is not None and len(brand_top5_df) > 0:
+            brand_top5_df.to_excel(writer, sheet_name="品牌TOP5", index=False)
+        if platform_df is not None and len(platform_df) > 0:
+            platform_df.to_excel(writer, sheet_name="平台效果对比", index=False)
+
+        # 1. 自动插入 AI 洞察页（美化版：按 ## / ### 拆分段落写入多行）
+        insight_text = ai_insight or "(尚未生成 AI 洞察报告)"
+        insight_lines = []
+        for line in insight_text.split("\n"):
+            stripped = line.strip()
+            if stripped:
+                insight_lines.append(stripped)
+        if not insight_lines:
+            insight_lines = [insight_text]
+        insight_rows = [{"行号": i + 1, "AI 洞察报告内容": l} for i, l in enumerate(insight_lines)]
+        pd.DataFrame(insight_rows).to_excel(writer, sheet_name="AI_Insight", index=False)
 
         # 2. 自动插入 Methodology 指标逻辑说明页
         pd.DataFrame({
@@ -494,21 +510,93 @@ def build_excel(flt, strategy_facts, top10, kw_df, brand_df, ai_insight: str) ->
                 
             cmp_ws.add_chart(chart, "I2")
 
+        # 6. AI_Insight Sheet 美化：标题行高亮 + 自动换行 + 加宽列
+        if "AI_Insight" in wb.sheetnames:
+            ai_ws = wb["AI_Insight"]
+            ai_ws.column_dimensions["A"].width = 8
+            ai_ws.column_dimensions["B"].width = 80
+            wrap_align = Alignment(wrap_text=True, vertical="top")
+            section_fill = PatternFill("solid", fgColor="E8F0FE")
+            section_font = Font(bold=True, size=12, color="1F4E79")
+            normal_font  = Font(size=11, color="333333")
+            for row in ai_ws.iter_rows(min_row=2, max_row=ai_ws.max_row, min_col=2, max_col=2):
+                cell = row[0]
+                cell.alignment = wrap_align
+                text_val = str(cell.value or "")
+                if text_val.startswith("#") or text_val.startswith("**"):
+                    cell.fill = section_fill
+                    cell.font = section_font
+                    ai_ws.row_dimensions[cell.row].height = 28
+                else:
+                    cell.font = normal_font
+                    ai_ws.row_dimensions[cell.row].height = 22
+
     return output
 # ══════════════════════════════════════════════════════════════
 # AI 报告生成
 # ══════════════════════════════════════════════════════════════
-def format_prompt(facts_df: pd.DataFrame) -> str:
+def format_prompt(facts_df: pd.DataFrame, flt_df: pd.DataFrame = None) -> str:
     text = facts_df.to_string(index=False)
-    if len(text) > 3000:
-        text = text[:3000] + "\n...[截断]"
+    if len(text) > 2500:
+        text = text[:2500] + "\n...[截断]"
+
+    # Build supplementary data summaries if flt_df is available
+    extra_sections = ""
+    if flt_df is not None and len(flt_df) > 0:
+        # Interaction type breakdown
+        interact_cols = ["点赞数", "收藏数", "评论数", "分享数"]
+        avail = [c for c in interact_cols if c in flt_df.columns]
+        if avail:
+            sums = {c: int(flt_df[c].sum()) for c in avail}
+            extra_sections += "\n【互动类型拆解】\n" + "\n".join(f"- {k}: {v:,}" for k, v in sums.items())
+
+        # Brand TOP 5
+        brand5 = flt_df.groupby("品牌名称")["互动总量"].sum().nlargest(5)
+        extra_sections += "\n\n【品牌互动 TOP 5】\n" + "\n".join(
+            f"- {b}: {int(v):,}" for b, v in brand5.items()
+        )
+
+        # Platform comparison
+        if "发布平台" in flt_df.columns:
+            plat = flt_df.groupby("发布平台").agg(
+                avg_interact=("互动总量", "mean"),
+                count=("内容标题", "count")
+            ).round(1)
+            extra_sections += "\n\n【发布平台效果】\n" + "\n".join(
+                f"- {p}: 平均互动={row['avg_interact']:.0f}, 发布量={int(row['count'])}"
+                for p, row in plat.iterrows()
+            )
+
+        # Posting time pattern
+        if "发布小时" in flt_df.columns:
+            top_hours = flt_df.groupby("发布小时")["互动总量"].mean().nlargest(3)
+            extra_sections += "\n\n【最佳发布时段 TOP 3】\n" + "\n".join(
+                f"- {int(h)}:00 平均互动={v:.0f}" for h, v in top_hours.items()
+            )
+
     return (
-        "你是资深内容营销分析师，请基于以下竞品数据输出：\n"
-        "## 一、内容效率洞察（哪个品牌效率最高？黑马特征是什么？）\n"
-        "## 二、营销动机洞察（哪种动机效果最好？）\n"
-        "## 三、战略建议（3 条具体可执行建议，注明适用品牌类型）\n"
-        f"---数据---\n{text}\n---\n"
-        "请用中文回答，600 字以内，语言专业简洁。"
+        "你是一位资深内容营销分析师，擅长从数据中提炼可落地的策略洞察。\n"
+        "请基于以下竞品数据，撰写一份结构清晰的分析报告。\n\n"
+        "## 报告结构（请严格按以下六个板块输出）\n\n"
+        "### 一、数据概览\n"
+        "简述本次分析的数据规模（品牌数、内容数、时间跨度）及整体互动水平。\n\n"
+        "### 二、品牌竞争力排名\n"
+        "结合互动总量与黑马指数，点评 TOP 3 品牌的策略特征；指出最具增长潜力的品牌。\n\n"
+        "### 三、互动结构洞察\n"
+        "分析点赞/收藏/评论/分享的比例关系，判断该品类用户的互动偏好特征。\n\n"
+        "### 四、内容策略洞察\n"
+        "哪种营销动机(成分科普/真实测评/场景种草等)效果最好？黑马内容有什么共性特征？最佳标题长度区间是多少字？\n\n"
+        "### 五、渠道与时段洞察\n"
+        "各发布平台效果差异；最佳发布时段和星期建议。\n\n"
+        "### 六、可执行建议（3-5 条）\n"
+        "给出具体、可直接落地的内容策略建议，每条注明适用的品牌类型或场景。\n\n"
+        "---以下为数据---\n"
+        "【Strategy Facts 竞品汇总表】\n"
+        f"{text}\n"
+        f"{extra_sections}\n"
+        "---数据结束---\n\n"
+        "要求：中文输出，800 字以内，语言专业但易读，"
+        "多用数据佐证结论，避免空洞描述。每个板块 2-4 句话即可。"
     )
 
 
@@ -544,8 +632,7 @@ def call_ai(api_key: str, model_type: str, prompt: str, temperature: float = 0.7
 CATEGORY_LEXICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "category_lexicon.json")
 
 # ── 本地配置：自动读取 Kimi 默认 Key ────────────────────────────
-# Key 存在用户主目录，不随项目文件夹分享出去
-_CONFIG_PATH = os.path.expanduser("~/.competitor-analysis/config.json")
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 def _load_config() -> dict:
     try:
         with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -657,11 +744,10 @@ with st.sidebar:
         st.warning("未检测到 openai 库，请在终端运行：\npip3 install openai")
     ai_temperature = st.slider(
         "🌡️ 创意温度",
-        min_value=0.0, max_value=1.5, value=0.7, step=0.1,
-        help="低温（0.2-0.5）= 贴近数据、稳健严谨；高温（0.9-1.5）= 发散创意、风格多变",
+        min_value=0.8, max_value=1.0, value=0.9, step=0.05,
+        help="0.80 = 贴近数据、稳健严谨；1.00 = 发散创意、风格多变（Kimi 仅支持 0.8-1.0）",
         key="ai_temperature",
     )
-    st.caption("低温 → 模仿爆款规律　　高温 → 创意头脑风暴")
 
     st.markdown("---")
     st.header("🎛️ 黑马指数调节")
@@ -693,37 +779,30 @@ with st.sidebar:
 # 主界面
 # ══════════════════════════════════════════════════════════════
 st.title("📊 竞品内容分析工具")
-st.caption("动态粉丝分层 · 品类感知词库 · 高分辨率特征 · AI 洞察 · Excel 图表导出")
+st.caption("动态粉丝分层 · 黑马指数 · 跨平台去水 · AI 洞察 · Excel 图表导出")
 
 if not file_bytes:
     st.info("👈 请在左侧上传 Excel 数据文件，或勾选「使用美妆护肤示例数据」开始分析")
 
-    with st.expander("📖 品类嵌套词库架构说明", expanded=True):
+    with st.expander("🐴 黑马指数 (BHI) 说明", expanded=True):
         st.markdown("""
-**词库结构：品类 -> 动机 -> 关键词（二级嵌套）**
+**什么是黑马指数？** 用来发现"以小博大"的内容 — 粉丝量不高但互动远超同层级平均水平。
 
-分析时按每条内容的"品类"字段自动调用对应词库，品类不在词库时退化到"通用"词库。
+**公式**：BHI = 互动率偏离度 x 效率权重 + 点赞规模偏离度 x 规模权重
 
-| 品类 | 动机 | 关键词示例 |
-|------|------|------------|
-| 护肤 | 痛点焦虑 | 避雷、爆痘、过敏 |
-| 护肤 | 权威背书 | 皮肤科医生、成分党 |
-| 彩妆 | 社交货币 | 氛围感、显白、高级感 |
-| 通用 | 利益获得 | 平替、干货、清单 |
+BHI > 1.2 即为黑马内容，说明该内容的互动表现显著超过同粉丝层级的平均水平。左侧边栏可调节效率/规模的权重比例。
         """)
 
-    with st.expander("📖 动态粉丝分层说明"):
+    with st.expander("🌊 跨平台去水折算说明"):
         st.markdown("""
-**分层方式：pd.qcut 四分位动态划分（去掉硬编码的 1w/10w）**
+**为什么要去水？** 不同平台的流量"含水量"不同。例如抖音一条视频动辄10w赞，但小红书1w赞已是大爆款。直接对比原始数据会产生严重误判。
 
-| 层级 | 含义 |
-|------|------|
-| 草根(Q1以下)  | 当前数据集粉丝量最低 25% |
-| 腰部(Q1-Q2)  | 25% - 50% 区间 |
-| 头腰(Q2-Q3)  | 50% - 75% 区间 |
-| 头部(Q3以上) | 最高 25% |
+开启去水模式后，所有互动数据会乘以对应平台的折算系数（以小红书为基准 1.0），消除平台间的通胀差异，实现真正的跨平台可比。
+        """)
 
-上传数据后，将在页面顶部显示当前数据集的具体分层阈值。
+    with st.expander("📊 动态粉丝分层说明"):
+        st.markdown("""
+基于当前上传数据的实际粉丝分布，使用四分位数 (pd.qcut) 动态划分为四层：草根、腰部、头腰、头部。每层占 25%，阈值随数据自动变化，上传后在页面顶部展示具体分层边界。
         """)
 
 else:
@@ -902,6 +981,58 @@ else:
                        color="互动总量", color_continuous_scale="Purples"),
                 use_container_width=True
             )
+
+        # ━━━ 新增 Row 2：互动类型拆解 + 品牌 TOP 5 ━━━━━━━━━━━━━━━━━━
+        c3, c4 = st.columns(2)
+        with c3:
+            st.subheader("💬 互动类型拆解")
+            interact_cols = ["点赞数", "收藏数", "评论数", "分享数"]
+            avail_interact = [c for c in interact_cols if c in flt.columns]
+            if avail_interact:
+                interact_sums = flt[avail_interact].sum().reset_index()
+                interact_sums.columns = ["互动类型", "总量"]
+                fig_interact = px.bar(interact_sums, x="互动类型", y="总量",
+                                      title="互动类型总量拆解",
+                                      color="互动类型",
+                                      color_discrete_sequence=px.colors.qualitative.Set2)
+                fig_interact.update_layout(showlegend=False, height=420)
+                st.plotly_chart(fig_interact, use_container_width=True)
+
+        with c4:
+            st.subheader("🏆 品牌 TOP 5 排行")
+            brand_top5 = flt.groupby("品牌名称")["互动总量"].sum().nlargest(5).reset_index()
+            brand_top5.columns = ["品牌名称", "互动总量"]
+            fig_brand5 = px.bar(brand_top5, x="互动总量", y="品牌名称",
+                                orientation="h", title="互动总量品牌 TOP 5",
+                                color="互动总量", color_continuous_scale="Teal")
+            fig_brand5.update_layout(yaxis=dict(autorange="reversed"), height=420,
+                                      coloraxis_showscale=False)
+            st.plotly_chart(fig_brand5, use_container_width=True)
+
+        # ━━━ 新增 Row 3：发布平台效果对比 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if "发布平台" in flt.columns:
+            st.subheader("📊 发布平台效果对比")
+            plat_metrics = flt.groupby("发布平台").agg(
+                平均互动量=("互动总量", "mean"),
+                平均互动率=("互动率", "mean"),
+                内容数量=("内容标题", "count"),
+            ).reset_index()
+            c5, c6 = st.columns(2)
+            with c5:
+                fig_plat_bar = px.bar(plat_metrics, x="发布平台", y="平均互动量",
+                                      title="各平台平均互动量",
+                                      color="发布平台",
+                                      color_discrete_sequence=px.colors.qualitative.Pastel)
+                fig_plat_bar.update_layout(showlegend=False, height=380)
+                st.plotly_chart(fig_plat_bar, use_container_width=True)
+            with c6:
+                fig_plat_cnt = px.bar(plat_metrics, x="发布平台", y="内容数量",
+                                      title="各平台内容发布量",
+                                      color="发布平台",
+                                      color_discrete_sequence=px.colors.qualitative.Pastel)
+                fig_plat_cnt.update_layout(showlegend=False, height=380)
+                st.plotly_chart(fig_plat_cnt, use_container_width=True)
+
             # ━━━ 新增：AI 爆款一键仿写模块 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         st.markdown("---")
         st.subheader("✨ AI 一键爆款仿写 (从洞察到产出)")
@@ -995,7 +1126,8 @@ else:
         with c1:
             st.plotly_chart(
                 px.bar(flt.groupby("发布小时")["互动总量"].mean().reset_index(),
-                       x="发布小时", y="互动总量", title="各时段平均互动量",
+                       x="发布小时", y="互动总量", title="各发布时段平均互动量",
+                       labels={"发布小时": "发布时段（小时）"},
                        color="互动总量", color_continuous_scale="Oranges"),
                 use_container_width=True
             )
@@ -1155,7 +1287,7 @@ else:
                 with st.spinner("🤖 AI 分析中（10-30 秒）…"):
                     try:
                         st.session_state.ai_insight = call_ai(
-                            api_key, model_type, format_prompt(strategy_facts),
+                            api_key, model_type, format_prompt(strategy_facts, flt),
                             temperature=ai_temperature,
                         )
                     except Exception as e:
@@ -1188,13 +1320,33 @@ else:
                     黑马指数=("黑马指数", "mean")
                 ).round(4).reset_index()
 
+        # 新增导出数据：互动类型 / 品牌 TOP5 / 平台对比
+        interact_cols = ["点赞数", "收藏数", "评论数", "分享数"]
+        avail_interact = [c for c in interact_cols if c in flt.columns]
+        interact_exp = flt[avail_interact].sum().reset_index()
+        interact_exp.columns = ["互动类型", "总量"]
+
+        brand_top5_exp = flt.groupby("品牌名称")["互动总量"].sum().nlargest(5).reset_index()
+        brand_top5_exp.columns = ["品牌名称", "互动总量"]
+
+        platform_exp = pd.DataFrame()
+        if "发布平台" in flt.columns:
+            platform_exp = flt.groupby("发布平台").agg(
+                平均互动量=("互动总量", "mean"),
+                平均互动率=("互动率", "mean"),
+                内容数量=("内容标题", "count"),
+            ).round(4).reset_index()
+
         excel_out = build_excel(
             flt, strategy_facts, top10_exp, kw_exp,
-            brand_exp, st.session_state.ai_insight
+            brand_exp, st.session_state.ai_insight,
+            interact_df=interact_exp,
+            brand_top5_df=brand_top5_exp,
+            platform_df=platform_exp,
         )
         today = datetime.now().strftime("%Y%m%d_%H%M")
         st.download_button(
-            "📥 下载完整分析报告（Excel · 6 Sheet）",
+            "📥 下载完整分析报告（Excel · 9 Sheet）",
             data=excel_out.getvalue(),
             file_name=f"竞品分析报告_{today}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1202,6 +1354,6 @@ else:
         )
         st.markdown(
             "**包含**：原始数据 · TOP10爆款 · 关键词分析 · "
-            "竞品对比(嵌入图表) · Strategy_Facts(黑马指数色阶) · AI_Insight\n\n"
+            "竞品对比(嵌入图表) · Strategy_Facts(色阶) · 互动类型拆解 · 品牌TOP5 · 平台效果对比 · AI_Insight\n\n"
             "**格式**：首行冻结 · 自动筛选 · 深蓝表头 · 自动列宽"
         )
